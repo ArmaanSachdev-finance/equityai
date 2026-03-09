@@ -3,16 +3,20 @@ import { useState } from "react";
 function fmt(n, d = 1) {
   if (n == null || isNaN(n)) return "N/A";
   if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(d) + "T";
-  if (Math.abs(n) >= 1e9)  return (n / 1e9).toFixed(d)  + "B";
-  if (Math.abs(n) >= 1e6)  return (n / 1e6).toFixed(d)  + "M";
+  if (Math.abs(n) >= 1e9)  return (n / 1e9).toFixed(d) + "B";
+  if (Math.abs(n) >= 1e6)  return (n / 1e6).toFixed(d) + "M";
   return n.toFixed(d);
 }
 function pct(n)  { return n == null || isNaN(n) ? "N/A" : (n * 100).toFixed(1) + "%"; }
 function usd(n)  { return n == null || isNaN(n) ? "N/A" : "$" + n.toFixed(2); }
 function safe(n) { return typeof n === "number" && isFinite(n) ? n : null; }
+function dig(obj, ...keys) {
+  for (const k of keys) { const v = safe(obj?.[k]); if (v !== null) return v; }
+  return null;
+}
 
 function runDCF(fcf, shares, price, growth, wacc = 0.10, tg = 0.03, years = 5) {
-  if (!fcf || !shares || fcf <= 0) return null;
+  if (!fcf || !shares || fcf <= 0 || shares <= 0) return null;
   let pv = 0, cf = fcf;
   for (let i = 1; i <= years; i++) { cf *= (1 + growth); pv += cf / Math.pow(1 + wacc, i); }
   const tv = (cf * (1 + tg)) / (wacc - tg);
@@ -33,43 +37,63 @@ async function fetchCompanyData(ticker) {
   const res = await fetch(`/api/stock?ticker=${t}`);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "Failed to fetch data.");
-  const { profile, income, cashflow, balance, quote, ratios } = data;
-  const p = profile[0] || {}, inc = income[0] || {}, incPrev = income[1] || {};
-  const cf = cashflow[0] || {}, bal = balance[0] || {}, q = quote[0] || {}, r = ratios[0] || {};
-  const revenue = safe(inc.revenue), revenuePrev = safe(incPrev.revenue);
-  const ebit = safe(inc.operatingIncome), netIncome = safe(inc.netIncome);
-  const ebitda = safe(inc.ebitda), fcfVal = safe(cf.freeCashFlow);
-  const totalDebt = safe(bal.totalDebt), equity = safe(bal.totalStockholdersEquity);
-  const shares = safe(p.sharesOutstanding) || safe(q.sharesOutstanding);
-  const price = safe(q.price) || safe(p.price), marketCap = safe(p.mktCap);
-  const pe = safe(r.peRatioTTM) || safe(q.pe), evEbitda = safe(r.enterpriseValueMultipleTTM);
-  if (!price) throw new Error(`No price data for "${t}". It may be delisted or not on FMP.`);
-  const revenueGrowth = revenue && revenuePrev ? (revenue - revenuePrev) / revenuePrev : null;
-  const ebitMargin = revenue && ebit ? ebit / revenue : null;
-  const netMargin = revenue && netIncome ? netIncome / revenue : null;
-  const debtEquity = totalDebt && equity ? totalDebt / equity : null;
+
+  const { quote, profile, income, cashflow, balance } = data;
+  const p   = profile[0]  || {};
+  const q   = quote[0]    || {};
+  const inc = income[0]   || {};
+  const incPrev = income[1] || {};
+  const cf  = cashflow[0] || {};
+  const bal = balance[0]  || {};
+
+  // Try multiple field names since FMP's new API changed some keys
+  const price     = dig(q, "price", "currentPrice") || dig(p, "price");
+  const marketCap = dig(q, "marketCap") || dig(p, "mktCap");
+  const shares    = dig(p, "sharesOutstanding") || dig(q, "sharesOutstanding");
+  const revenue   = dig(inc, "revenue", "totalRevenue");
+  const revPrev   = dig(incPrev, "revenue", "totalRevenue");
+  const ebit      = dig(inc, "operatingIncome", "ebit");
+  const netIncome = dig(inc, "netIncome");
+  const ebitda    = dig(inc, "ebitda") || dig(p, "ebitda");
+  // FCF: try multiple field names
+  const fcfVal    = dig(cf, "freeCashFlow", "freeCashflow", "netCashProvidedByOperatingActivities");
+  const totalDebt = dig(bal, "totalDebt", "longTermDebt");
+  const equity    = dig(bal, "totalStockholdersEquity", "stockholdersEquity");
+  const pe        = dig(q, "pe", "priceEarningsRatio");
+  const evEbitda  = dig(q, "enterpriseValueOverEBITDA") || dig(p, "evToEbitda");
+
+  if (!price) throw new Error(`No price data for "${t}". It may be delisted.`);
+
+  const revenueGrowth = revenue && revPrev ? (revenue - revPrev) / revPrev : null;
+  const ebitMargin    = revenue && ebit    ? ebit / revenue    : null;
+  const netMargin     = revenue && netIncome ? netIncome / revenue : null;
+  const debtEquity    = totalDebt && equity  ? totalDebt / equity  : null;
+
   return {
-    name: p.companyName, ticker: t, industry: p.industry || p.sector || "—",
-    price, marketCap, shares, revenue, revenuePrev, ebit, netIncome, ebitda,
+    name: p.companyName || p.name || t,
+    ticker: t,
+    industry: p.industry || p.sector || "—",
+    price, marketCap, shares,
+    revenue, ebit, netIncome, ebitda,
     fcf: fcfVal, totalDebt, equity, pe, evEbitda,
     metrics: { revenueGrowth, ebitMargin, netMargin, debtEquity, fcf: fcfVal, pe, evEbitda },
   };
 }
 
 async function generateSummary(data, dcf) {
-  const { ticker, name, metrics: m } = data;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/summary", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 1000,
-      messages: [{ role: "user", content: `You are a senior equity research analyst. Write a concise, professional equity research commentary for ${ticker} (${name}).
-Financial Data: Revenue Growth: ${pct(m.revenueGrowth)}, EBIT Margin: ${pct(m.ebitMargin)}, Net Margin: ${pct(m.netMargin)}, P/E: ${m.pe ? m.pe.toFixed(1)+"x" : "N/A"}, EV/EBITDA: ${m.evEbitda ? m.evEbitda.toFixed(1)+"x" : "N/A"}, D/E: ${m.debtEquity ? m.debtEquity.toFixed(2) : "N/A"}, FCF: ${m.fcf ? "$"+fmt(m.fcf) : "N/A"}${dcf ? `, DCF: ${usd(dcf.impliedPrice)} (${dcf.upside>0?"+":""}${dcf.upside.toFixed(1)}% vs current)` : ""}.
-Write 3-4 sentences on business quality, valuation, and key risks. Be specific. Sound like a real Wall Street analyst. End with one clear investment takeaway.` }],
+      ticker: data.ticker,
+      name: data.name,
+      metrics: data.metrics,
+      dcf: dcf ? { impliedPrice: dcf.impliedPrice, upside: dcf.upside } : null,
     }),
   });
   const d = await res.json();
-  return d.content?.map(b => b.text || "").join("") || "Summary unavailable.";
+  if (!res.ok) throw new Error(d.error || "Summary failed");
+  return d.summary;
 }
 
 const MetricCard = ({ label, value, sub, highlight }) => (
@@ -86,31 +110,44 @@ const Badge = ({ text, color }) => {
 };
 
 export default function App() {
-  const [ticker, setTicker] = useState("");
-  const [stage, setStage] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [report, setReport] = useState(null);
+  const [ticker, setTicker]       = useState("");
+  const [stage, setStage]         = useState("");
+  const [loading, setLoading]     = useState(false);
+  const [error, setError]         = useState(null);
+  const [report, setReport]       = useState(null);
   const [aiSummary, setAiSummary] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError]     = useState(null);
+
   const suggested = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "JPM", "TSLA", "SHOP", "V", "BRK-B", "UBER"];
 
   async function run(inputTicker) {
     const t = (inputTicker || ticker).toUpperCase().trim();
     if (!t) return;
-    setLoading(true); setReport(null); setAiSummary(""); setError(null);
+    setLoading(true); setReport(null); setAiSummary(""); setError(null); setAiError(null);
     try {
       setStage("Fetching live financial data…");
       const data = await fetchCompanyData(t);
+
       setStage("Running DCF model…");
       await new Promise(r => setTimeout(r, 250));
       const growth = data.metrics.revenueGrowth ? Math.min(Math.max(data.metrics.revenueGrowth, 0.02), 0.30) : 0.07;
-      const dcf = data.fcf > 0 ? runDCF(data.fcf, data.shares, data.price, growth) : null;
-      const sensitivity = data.fcf > 0 ? buildSensitivity(data.fcf, data.shares, data.price, growth) : null;
-      setLoading(false); setReport({ data, dcf, sensitivity });
-      setAiLoading(true); setStage("Generating AI analyst summary…");
-      const summary = await generateSummary(data, dcf);
-      setAiSummary(summary); setAiLoading(false);
+      const dcf = (data.fcf && data.fcf > 0 && data.shares && data.shares > 0)
+        ? runDCF(data.fcf, data.shares, data.price, growth) : null;
+      const sensitivity = dcf ? buildSensitivity(data.fcf, data.shares, data.price, growth) : null;
+
+      setLoading(false);
+      setReport({ data, dcf, sensitivity });
+
+      setAiLoading(true);
+      setStage("Generating AI analyst summary…");
+      try {
+        const summary = await generateSummary(data, dcf);
+        setAiSummary(summary);
+      } catch (e) {
+        setAiError(e.message);
+      }
+      setAiLoading(false);
     } catch (e) {
       setError(e.message || "Something went wrong."); setLoading(false); setAiLoading(false);
     }
@@ -131,6 +168,7 @@ export default function App() {
         .sens-row:hover td{background:rgba(251,191,36,0.04)!important;}
         ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
       `}</style>
+
       <div style={{ minHeight: "100vh", background: "#080c14", fontFamily: "'Sora', sans-serif", color: "#f3f4f6", paddingBottom: 80 }}>
         <div style={{ borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "18px 40px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -140,6 +178,7 @@ export default function App() {
           </div>
           <span style={{ fontSize: 11, color: "#374151", fontFamily: "monospace" }}>FMP + CLAUDE AI</span>
         </div>
+
         <div style={{ maxWidth: 980, margin: "0 auto", padding: "52px 24px 0" }}>
           <div style={{ textAlign: "center", marginBottom: 48 }}>
             <div style={{ fontSize: 10, letterSpacing: "0.2em", color: "#fbbf24", marginBottom: 18, fontFamily: "monospace" }}>AI EQUITY RESEARCH — ANY TICKER, NO SIGNUP</div>
@@ -147,8 +186,11 @@ export default function App() {
               Institutional research.<br />
               <span style={{ background: "linear-gradient(90deg,#fbbf24,#f97316)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Any stock. Instantly.</span>
             </h1>
-            <p style={{ color: "#6b7280", fontSize: 15, maxWidth: 500, margin: "0 auto", lineHeight: 1.75 }}>Live financials, DCF valuation, sensitivity analysis, and an AI analyst summary — for any publicly traded company. No signup required.</p>
+            <p style={{ color: "#6b7280", fontSize: 15, maxWidth: 500, margin: "0 auto", lineHeight: 1.75 }}>
+              Live financials, DCF valuation, sensitivity analysis, and an AI analyst summary — for any publicly traded company. No signup required.
+            </p>
           </div>
+
           <div style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 18, padding: "26px", marginBottom: 32 }}>
             <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
               <input value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && run()} placeholder="Enter any ticker: AAPL, SHOP, UBER…"
@@ -166,8 +208,10 @@ export default function App() {
               ))}
             </div>
           </div>
+
           {loading && <div style={{ textAlign: "center", padding: "56px 0" }}><div className="spin" style={{ fontSize: 26, marginBottom: 14, color: "#fbbf24" }}>⟳</div><div className="pulse" style={{ fontSize: 13, color: "#6b7280", fontFamily: "monospace" }}>{stage}</div></div>}
           {error && <div style={{ background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 12, padding: "18px 22px", color: "#f87171", fontFamily: "monospace", fontSize: 13, lineHeight: 1.7 }}>⚠ {error}</div>}
+
           {report && (() => {
             const { data, dcf, sensitivity } = report;
             const m = data.metrics;
@@ -185,6 +229,7 @@ export default function App() {
                     {dcf && <div style={{ marginTop: 10, display: "flex", gap: 7, justifyContent: "flex-end", flexWrap: "wrap" }}><Badge text={`DCF: ${usd(dcf.impliedPrice)}`} color="yellow" /><Badge text={`${dcf.upside > 0 ? "+" : ""}${dcf.upside.toFixed(1)}% upside`} color={upsideColor} /></div>}
                   </div>
                 </div>
+
                 <div style={{ marginBottom: 22 }}>
                   <div style={{ fontSize: 10, letterSpacing: "0.16em", color: "#6b7280", fontFamily: "monospace", marginBottom: 13 }}>KEY METRICS</div>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(175px,1fr))", gap: 11 }}>
@@ -198,6 +243,7 @@ export default function App() {
                     <MetricCard label="Market Cap" value={"$" + fmt(data.marketCap)} sub={data.industry} />
                   </div>
                 </div>
+
                 {dcf && sensitivity && (
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, marginBottom: 22 }}>
                     <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 14, padding: "22px" }}>
@@ -225,19 +271,29 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
                 {!dcf && <div style={{ background: "rgba(239,68,68,0.05)", border: "1px solid rgba(239,68,68,0.15)", borderRadius: 12, padding: "14px 20px", fontSize: 13, color: "#f87171", fontFamily: "monospace", marginBottom: 22 }}>⚠ DCF not available — {data.ticker} reported negative or unavailable free cash flow.</div>}
+
                 <div style={{ background: "rgba(251,191,36,0.03)", border: "1px solid rgba(251,191,36,0.15)", borderRadius: 14, padding: "24px 26px" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
                     <div style={{ fontSize: 10, letterSpacing: "0.16em", color: "#fbbf24", fontFamily: "monospace" }}>AI ANALYST SUMMARY</div>
                     <span style={{ fontSize: 10, padding: "3px 9px", background: "rgba(251,191,36,0.1)", color: "#fbbf24", borderRadius: 4, fontFamily: "monospace" }}>claude-sonnet-4</span>
                   </div>
-                  {aiLoading ? <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#6b7280", fontFamily: "monospace", fontSize: 13 }}><span className="spin">⟳</span><span className="pulse">Writing analyst summary…</span></div>
-                    : <p style={{ fontSize: 15, lineHeight: 1.85, color: "#d1d5db" }}>{aiSummary}</p>}
+                  {aiLoading
+                    ? <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#6b7280", fontFamily: "monospace", fontSize: 13 }}><span className="spin">⟳</span><span className="pulse">Writing analyst summary…</span></div>
+                    : aiError
+                      ? <div style={{ color: "#f87171", fontFamily: "monospace", fontSize: 13 }}>⚠ Could not generate summary: {aiError}</div>
+                      : <p style={{ fontSize: 15, lineHeight: 1.85, color: "#d1d5db" }}>{aiSummary}</p>
+                  }
                 </div>
-                <div style={{ marginTop: 20, fontSize: 10, color: "#374151", textAlign: "center", fontFamily: "monospace", lineHeight: 1.9 }}>For educational purposes only · Not financial advice · Data via Financial Modeling Prep · Always do your own research</div>
+
+                <div style={{ marginTop: 20, fontSize: 10, color: "#374151", textAlign: "center", fontFamily: "monospace", lineHeight: 1.9 }}>
+                  For educational purposes only · Not financial advice · Data via Financial Modeling Prep · Always do your own research
+                </div>
               </div>
             );
           })()}
+
           {!report && !loading && !error && (
             <div style={{ textAlign: "center", padding: "70px 0", color: "#374151" }}>
               <div style={{ fontSize: 44, marginBottom: 18, opacity: 0.25 }}>◈</div>
