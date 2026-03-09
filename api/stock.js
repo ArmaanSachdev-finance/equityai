@@ -15,13 +15,22 @@ export default async function handler(req, res) {
       fetch(`${base}/cash-flow-statement?symbol=${t}&limit=1&apikey=${key}`),
       fetch(`${base}/balance-sheet-statement?symbol=${t}&limit=1&apikey=${key}`),
     ]);
-    const [quote, profile, income, cashflow, balance] = await Promise.all([
-      quoteRes.json(), profileRes.json(), incomeRes.json(), cashflowRes.json(), balanceRes.json(),
+    const [quoteText, profileText, incomeText, cashflowText, balanceText] = await Promise.all([
+      quoteRes.text(), profileRes.text(), incomeRes.text(), cashflowRes.text(), balanceRes.text(),
     ]);
-    if (!Array.isArray(profile) || profile.length === 0) {
-      return res.status(404).json({ error: `Ticker "${t}" not found. Try AAPL, MSFT, or NVDA.` });
+    const allText = [quoteText, profileText, incomeText, cashflowText, balanceText].join(" ");
+    if (allText.includes("Premium") || allText.includes("Upgrade") || allText.includes("subscription")) {
+      return res.status(403).json({
+        error: `"${t}" requires a premium FMP plan. Try AAPL, MSFT, NVDA, GOOGL, AMZN, META, JPM, or TSLA — these work on the free plan.`,
+      });
     }
-    res.status(200).json({ quote, profile, income, cashflow, balance, ratios: [] });
+    const [quote, profile, income, cashflow, balance] = [quoteText, profileText, incomeText, cashflowText, balanceText].map(text => {
+      try { return JSON.parse(text); } catch { return []; }
+    });
+    if (!Array.isArray(profile) || profile.length === 0) {
+      return res.status(404).json({ error: `Ticker "${t}" not found. Check the symbol and try again.` });
+    }
+    res.status(200).json({ quote, profile, income, cashflow, balance });
   } catch (e) {
     res.status(500).json({ error: "Server error: " + e.message });
   }
