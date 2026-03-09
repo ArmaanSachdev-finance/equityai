@@ -12,7 +12,7 @@ export default async function handler(req, res) {
       fetch(`${base}/quote?symbol=${t}&apikey=${key}`),
       fetch(`${base}/profile?symbol=${t}&apikey=${key}`),
       fetch(`${base}/income-statement?symbol=${t}&limit=2&apikey=${key}`),
-      fetch(`${base}/cash-flow-statement?symbol=${t}&limit=1&apikey=${key}`),
+      fetch(`${base}/cash-flow-statement?symbol=${t}&limit=2&apikey=${key}`),
       fetch(`${base}/balance-sheet-statement?symbol=${t}&limit=1&apikey=${key}`),
     ]);
     const [quoteText, profileText, incomeText, cashflowText, balanceText] = await Promise.all([
